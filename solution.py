@@ -1,8 +1,7 @@
-#!/usr/bin/env python
-# coding: utf-8
+
 
 # In[1]:
-
+# print_file("\n ---IMPORTING--- \n")
 
 import pandas as pd
 from sklearn.preprocessing import OneHotEncoder
@@ -21,15 +20,56 @@ import numpy as np
 from torch import autograd
 import gc
 from sentence_transformers import SentenceTransformer
+import torch.nn.init as init
+import argparse
+import os
 torch.set_default_dtype(torch.float32)
 torch.set_default_device('cuda')
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--frac", type=float, default=1/1000)
+parser.add_argument("--status_file", type=str, default="status_debug.txt")
+args = parser.parse_args()
+
+with open(args.status_file, 'w') as f:
+    f.write("\n")
+
+def print_file(text):
+    with open(args.status_file, 'a') as f:
+        f.write(text + '\n')
 
 # In[2]:
+print_file("\n ---STARTING--- \n")
+
+EMBED_DIM = 512
+DATA_FRAC = 1 / 1000
+
+preprocess_prompt = """
+    The following data is a review by a user of an anonymous hotel/accomodation.
+    The review title is: {title}.
+    The user wrote this positive review portion: {positive}.
+    The user wrote this negative review portion: {negative}.
+    The overall Score the user gave is: {score}.
+    When published, this review garnered {review} 'helpful' notes.
+    
+    """
+preprocess_prompt_no_score_votes = """
+    Review title is: {title}.
+    Positive review portion: {positive}.
+    Negative review portion: {negative}.
+"""
+
+# In[18]:
 
 
-embedding_dimensions = 512
+def format_review(user_review):
+    return preprocess_prompt.format(title=user_review['review_title'], positive=user_review['review_positive'],
+                                                    negative=user_review['review_negative'], score=user_review['review_score'],
+                                                    review=user_review['review_helpful_votes'])
 
+def format_review_no_score_votes(user_review):
+    return preprocess_prompt_no_score_votes.format(title=user_review['review_title'], positive=user_review['review_positive'],
+                                                    negative=user_review['review_negative'])
 
 # In[3]:
 
@@ -61,7 +101,7 @@ def embed_batch(input_texts):
 
 
 def embed_llm(input_texts):
-    mini_batch_size = 50
+    mini_batch_size = 100
     len_input = len(input_texts)
     if len_input > mini_batch_size:
         embed_list = []
@@ -82,7 +122,7 @@ def embed_llm(input_texts):
 # In[6]:
 
 
-embedding_model = SentenceTransformer("mixedbread-ai/mxbai-embed-large-v1", truncate_dim=embedding_dimensions)
+embedding_model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
 
 
 # In[47]:
@@ -100,7 +140,7 @@ embedding_model = SentenceTransformer("mixedbread-ai/mxbai-embed-large-v1", trun
 # In[8]:
 
 
-def load_dataset(part='train', num=0):
+def load_dataset(part='train', frac=None):
     if part=='train':
         users = pd.read_csv("Data/train_users.csv")
         reviews = pd.read_csv("Data/train_reviews.csv")
@@ -109,16 +149,19 @@ def load_dataset(part='train', num=0):
         users = pd.read_csv("Data/val_users.csv")
         reviews = pd.read_csv("Data/val_reviews.csv")
         matches = pd.read_csv("Data/val_matches.csv")
-    if num > 0:
-        users = users.sample(n=num)
+    if frac:
+        # sample the data, and make sure to take users that match the sampled reviews
+        reviews = reviews.sample(frac=frac)
+        matches = matches[matches['review_id'].isin(reviews['review_id'])]
+        users = users[users['user_id'].isin(matches['user_id'])]
     return users, reviews, matches
 
 
 # In[9]:
-print("Loading Data")
+print_file("Loading Data")
 
-users_train, reviews_train, matches_train = load_dataset('train')
-users_val, reviews_val, matches_val = load_dataset('val')
+users_train, reviews_train, matches_train = load_dataset('train', frac=args.frac)
+users_val, reviews_val, matches_val = load_dataset('val', frac=args.frac)
 reviews_train = reviews_train.fillna("None Given")
 reviews_val = reviews_val.fillna("None Given")
 
@@ -129,9 +172,9 @@ reviews_val = reviews_val.fillna("None Given")
 def check_diff(feature):
     unique_train = set(users_train[feature])
     unique_val = set(users_val[feature])
-    print(len(set(users_train[feature]) | set(users_val[feature])))
-    print(len(users_train[~users_train[feature].isin(unique_val)]))
-    print(users_train[~users_train[feature].isin(unique_val)][feature].value_counts())
+    print_file(len(set(users_train[feature]) | set(users_val[feature])))
+    print_file(len(users_train[~users_train[feature].isin(unique_val)]))
+    print_file(users_train[~users_train[feature].isin(unique_val)][feature].value_counts())
 
 
 # In[12]:
@@ -168,129 +211,132 @@ binary_encoder.fit(aligned_data)
 
 
 def preprocess_users(users):
+    columns_to_avg_std = ['accommodation_star_rating', 'accommodation_score', 'room_nights']
+    columns_to_count = ['guest_country', 'guest_type', 'accommodation_country']
+    for col in columns_to_avg_std:
+        average = users.groupby('accommodation_id')[col].mean()
+        users[f'average_{col}'] = users['accommodation_id'].map(average)
+    for col in columns_to_count:
+        count = users[col].value_counts(normalize=True)
+        users[f'count_{col}'] = users[col].map(count)
+    average_month = users['month'].mean()
+    users['average_month'] = average_month
     onehot_encoder = OneHotEncoder(sparse_output=False)
     binary_encoded = binary_encoder.transform(users[target_cols])
+    # replace the target columns with the binary encoded columns
     encoded = pd.concat([users, binary_encoded], axis=1)
     encoded = encoded.drop(target_cols, axis=1)
     onehot_encoded = onehot_encoder.fit_transform(encoded[['guest_type']])
     encoded = pd.concat([encoded, onehot_encoded], axis=1)
     encoded = encoded.drop(['guest_type'], axis=1)
-    normalized_encoded = MinMaxScaler().fit_transform(encoded[encoded.columns.difference(['user_id'])])
-    normalized_encoded = pd.concat([encoded['user_id'], normalized_encoded])
+    features_to_normalize = ['accommodation_score', 'month', 'room_nights', 'accommodation_star_rating', 'average_month'
+                             ] + [f'average_{col}' for col in columns_to_avg_std]
+    normalized_values = MinMaxScaler().fit_transform(users[features_to_normalize])
+    encoded = encoded.drop(features_to_normalize, axis=1)
+    encoded = pd.concat([encoded, normalized_values], axis=1)
     return encoded
 
 
+def preprocess_reviews(reviews):
+    reviews['review_format'] = reviews.apply(format_review_no_score_votes, axis=1)
+    reviews['review_embed'] = reviews['review_format'].apply(lambda x: F.normalize(embedding_model.encode(x,
+                                                                                                          convert_to_tensor=True), dim=-1))
+    features_to_normalize = ['review_score', 'review_helpful_votes']
+    normalized_values = MinMaxScaler().fit_transform(reviews[features_to_normalize])
+    reviews = reviews.drop(features_to_normalize, axis=1)
+    reviews = pd.concat([reviews, normalized_values], axis=1)
+    # concat review_embed and average and std columns
+    reviews['review_embed'] = reviews.apply(lambda x: torch.cat([x['review_embed'].cpu(),
+                                                                     torch.tensor(x['review_score']).unsqueeze(0).cpu(),
+                                                                    torch.tensor(x[
+                                                                                     'review_helpful_votes']).unsqueeze(0).cpu(),
+                                                                    ], dim=-1), axis=1)
+    return reviews
 # In[15]:
 
-print("Prepping Data")
-# print(users_train[['guest_type']])
+print_file("Prepping Data")
+# print_file(users_train[['guest_type']])
 prep_users_train = preprocess_users(users_train)
 prep_users_val = preprocess_users(users_val)
 
+if os.path.exists("Data/prep_users_train.pkl"):
+    prep_reviews_train = pd.read_pickle("Data/prep_reviews_train.pkl")
+    prep_reviews_val = pd.read_pickle("Data/prep_reviews_val.pkl")
 
+else:
+    prep_reviews_train = preprocess_reviews(reviews_train)
+    prep_reviews_val = preprocess_reviews(reviews_val)
+
+    if not os.path.exists("Data/prep_users_train.pkl"):
+        prep_reviews_train.to_pickle("Data/prep_reviews_train.pkl")
+        prep_reviews_val.to_pickle("Data/prep_reviews_val.pkl")
+
+OUTPUT_DIM = prep_reviews_train['review_embed'].iloc[0].shape[0]
+EPOCHS = 5
+INPUT_DIM = prep_users_train.shape[1] - 2
+D_MODEL = 512
+MLP_1 = 128
+MLP_2 = 256
+LR = 0.0001
+BATCH_SIZE = 16
+GRAD_CLIP = 0.1
+PRINT_EVERY = 100
+SAVE_EVERY = 10000
+MODEL_PATH = "Models/Model_Cosine"
 
 # In[64]:
 
 
-class TransformerEncoder(nn.Module):
-    def __init__(self, d_model, num_heads, num_layers, ff_dim, input_dim=33, embedding_dim=embedding_dimensions, dropout=0.1):
-        """
-        Args:
-            input_dim (int): Size of the flattened input.
-            embedding_dim (int): Dimension of the output embedding space.
-            d_model (int): Dimension of the Transformer model (hidden size).
-            num_heads (int): Number of attention heads.
-            num_layers (int): Number of Transformer encoder layers.
-            ff_dim (int): Dimension of the feedforward network.
-            dropout (float): Dropout rate.
-        """
-        super(TransformerEncoder, self).__init__()
+class LatentSpaceEmbedder(nn.Module):
+    def __init__(self, input_dim=INPUT_DIM, hidden_dim=D_MODEL, mlp_1=MLP_1, mlp_2=MLP_2,
+                 output_dim=OUTPUT_DIM, dropout=0.1):
+        super(LatentSpaceEmbedder, self).__init__()
         
-        # Input projection: Project input into d_model dimension
-        self.input_proj = nn.Linear(input_dim, d_model)
-        self.input_bn = nn.BatchNorm1d(d_model)
-        # Positional encoding (to give position information to the Transformer)
-        self.positional_encoding = PositionalEncoding(d_model, dropout)
-
-        # Transformer Encoder Layers
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, 
-            nhead=num_heads, 
-            dim_feedforward=ff_dim, 
-            dropout=dropout,
-            # activation='gelu',
-            batch_first=True
+        # Normalization layer
+        self.normalization = nn.BatchNorm1d(input_dim, dtype=torch.get_default_dtype())
+        self.dropout = nn.Dropout(dropout)
+        # Fully connected layers with dropout and batch normalization
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, mlp_1),
+            nn.BatchNorm1d(mlp_1, dtype=torch.get_default_dtype()),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_1, mlp_2),
+            nn.BatchNorm1d(mlp_2, dtype=torch.get_default_dtype()),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_2, output_dim),
+            nn.BatchNorm1d(output_dim, dtype=torch.get_default_dtype()),
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers,)
-        self.encoder_bn = nn.BatchNorm1d(d_model)
-        # Final projection to embedding space
-        self.output_proj = nn.Linear(d_model, embedding_dim)
+
+        # Xavier initialization
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        # Apply Xavier initialization to all Linear layers in the model
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                init.xavier_uniform_(m.weight)  # Uniform Xavier initialization
+                if m.bias is not None:
+                    m.bias.data.fill_(0)  # Initialize biases to zero
+
+
     
     def forward(self, x):
         """
-        Forward pass.
-        Args:
-            x (torch.Tensor): Input tensor of shape [batch_size, input_dim].
-        Returns:
-            torch.Tensor: Embedded output of shape [batch_size, embedding_dim].
+        x: Tensor of shape (batch_size, input_dim)
         """
-        # Project input to d_model
-        x = self.input_proj(x)  # Shape: [batch_size, d_model]
-        x = self.input_bn(x)
-        # Add positional encoding (sequence length = 1 since input is flattened)
-        x = self.positional_encoding(x.unsqueeze(1))  # Add sequence dimension: [batch_size, seq_len=1, d_model]
+        # Normalize the input
+        x = self.normalization(x)
         
-        # Pass through Transformer Encoder
-        x = self.transformer_encoder(x)  # Shape: [batch_size, seq_len=1, d_model]
-        
-        # Remove sequence dimension and project to embedding space
-        x = x.squeeze(1)  # Shape: [batch_size, d_model]
-        x = self.encoder_bn(x)
-        x = self.output_proj(x)  # Shape: [batch_size, embedding_dim]
-        x = x.squeeze(0)
-        return x
-
-class PositionalEncoding(nn.Module):
-    """Positional Encoding Module to add positional information to the Transformer inputs."""
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        
-        # Compute the positional encodings once in log space.
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-torch.log(torch.tensor(10000.0)) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # Shape: [1, max_len, d_model]
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        x = x + self.pe[:, :x.size(1)]  # Add positional encoding
-        return self.dropout(x)
+        # Pass through MLP to generate embeddings
+        output = self.mlp(x)
+        return output
 
 
 # In[17]:
 
 
-preprocess_prompt = """
-    The following data is a review by a user of an anonymous hotel/accomodation.
-    The review title is: {title}.
-    The user wrote this positive review portion: {positive}.
-    The user wrote this negative review portion: {negative}.
-    The overall Score the user gave is: {score}.
-    When published, this review garnered {review} 'helpful' notes.
-    
-    """
-
-
-# In[18]:
-
-
-def format_review(user_review):
-    return preprocess_prompt.format(title=user_review['review_title'], positive=user_review['review_positive'],
-                                                    negative=user_review['review_negative'], score=user_review['review_score'],
-                                                    review=user_review['review_helpful_votes'])
 
 
 # In[19]:
@@ -301,6 +347,7 @@ def merge_data(users, reviews, matches):
     merged_u_m_r = pd.merge(merged_m_r, users, on='user_id', how='inner')
     # merged_u_m_r = merged_u_m_r.rename(columns={"accommodation_id_x": "accommodation_id"})
     return merged_u_m_r
+
 
 
 # In[20]:
@@ -334,15 +381,41 @@ class UserReviewDataset(Dataset):
     
     def __getitem__(self, idx):
         sample = self.merged.iloc[idx]
-        user_cols = ['accommodation_id_x'] + self.users.columns.tolist()
+        user_cols = self.users.columns.tolist()
         user = sample[user_cols]
-        user_review = sample[['review_title', 'review_positive', 'review_negative', 'review_score', 'review_helpful_votes']]
-        formatted_review = format_review(user_review=user_review)
-        user = torch.tensor(user.values.astype(np.float32)).detach()
-        return user, formatted_review
+        # user_review = sample[['review_title', 'review_positive', 'review_negative', 'review_score', 'review_helpful_votes']]
+        # formatted_review = format_review(user_review=user_review)
+        # get review tensor from series
+        user_review = sample['review_embed']
+        user = torch.tensor(user.values.astype(np.float32), dtype=torch.get_default_dtype()).detach()
+        target = 1
+        return user, user_review, target
 
 
-# In[22]:
+class NegativeSampleDataset(Dataset):
+    def __init__(self, users, reviews, matches):
+          # User data
+        self.matches = matches
+        self.reviews = reviews
+        self.merged = merge_data(users, reviews, matches)
+        self.users = users.drop(columns=['user_id', 'accommodation_id'])
+    def __len__(self):
+        return len(self.merged)
+        
+    def sample(self, frac):
+        self.merged = self.merged.sample(frac=frac)
+    
+    def __getitem__(self, idx):
+        sample = self.merged.iloc[idx]
+        user_cols = self.users.columns.tolist()
+        user = sample[user_cols]
+        random_review = self.reviews.sample(n=1)
+        # formatted_review = format_review(random_review)
+        # get value from series
+        review_embed = random_review['review_embed'].values[0]
+        user = torch.tensor(user.values.astype(np.float32), dtype=torch.get_default_dtype()).detach()
+        target = -1
+        return user, review_embed, target
 
 
 class EvalDataset(Dataset):
@@ -360,26 +433,29 @@ class EvalDataset(Dataset):
     
     def __getitem__(self, idx):
         sample = self.merged.iloc[idx]
-        user_cols = ['accommodation_id_x'] + self.users.columns.tolist()
+        user_cols =  self.users.columns.tolist()
         user = sample[user_cols]
-        user = torch.tensor(user.values.astype(np.float32)).detach()
+        user = torch.tensor(user.values.astype(np.float32), dtype=torch.get_default_dtype()).detach()
         return user, sample['accommodation_id_x'], sample['review_id']
+
+
+class ContrastiveLoss(torch.nn.Module):
+    def __init__(self, margin=2.0):
+        super(ContrastiveLoss, self).__init__()
+        self.margin = margin
+
+    def forward(self, output1, output2, target):
+        euclidean_distance = F.pairwise_distance(output1, output2)
+        pos = (target) * euclidean_distance.pow(2)
+        neg = (1-target) * torch.clamp(self.margin - euclidean_distance, min=0.0).pow(2)
+        loss_contrastive = torch.mean(pos + neg)
+        return loss_contrastive
 
 
 # In[62]:
 
 
-EPOCHS = 5
-D_MODEL=1024
-NUM_HEADS=8
-NUM_LAYERS=2
-FF_DIM=1024
-LR = 0.001
-BATCH_SIZE = 32
-GRAD_CLIP = 1.
-SAVE_EVERY = 10000
-PRINT_EVERY = 10
-MODEL_PATH = "Models/model_B"
+
 
 # In[24]:
 
@@ -396,37 +472,40 @@ def del_all(model, dataset, dataloader):
 # In[35]:
 
 
-def eval_model(model, user_val, review_val, match_val):
+def eval_model(model, user_val, review_val, match_val, frac=1):
     model.eval()
     dataset = EvalDataset(user_val, review_val, match_val)
-    dataset.sample(frac=1/1000)
+    dataset.sample(frac=frac)
     dataloader = DataLoader(dataset=dataset, batch_size=1, shuffle=True, generator=torch.Generator(device='cuda'))
-    total_mrr = 0
+    total_rr = 0
     num_samples = 0
-    print("Starting model eval")
+    print_file("Starting model eval")
     with torch.no_grad():
         similarity = torch.nn.CosineSimilarity()
+        # similarity = F.pairwise_distance
         for batch in dataloader:
             user, accommodation_id, actual_review_id = batch
             possible_user_reviews = review_val[review_val['accommodation_id'] == accommodation_id.item()]
             possible_user_reviews_reset = possible_user_reviews.reset_index(drop=True)
             actual_review_id = actual_review_id[0]
             actual_review_index = possible_user_reviews_reset[possible_user_reviews_reset['review_id'] == actual_review_id].index[0]
-            possible_user_reviews = possible_user_reviews.apply(format_review, axis=1).to_list()
-            embedded_possible_user_reviews = embed_llm(possible_user_reviews)
-            embedded_user = model(user)
-            similarity_vector = similarity(embedded_user, embedded_possible_user_reviews)
-            topk_values, topk_indices = torch.topk(similarity_vector, k=10)
+            possible_user_reviews_embed = torch.stack(possible_user_reviews['review_embed'].to_list()).cpu().type(
+                torch.float32)
+            # possible_user_reviews = possible_user_reviews.apply(format_review, axis=1).to_list()
+            # embedded_possible_user_reviews = embed_llm(possible_user_reviews)
+            embedded_user = model(user).cpu().type(torch.float32)
+            similarity_vector = similarity(embedded_user, possible_user_reviews_embed)
+            k = min(10, len(possible_user_reviews))
+            topk_values, topk_indices = torch.topk(similarity_vector, k=k, largest=True)
            
-            if actual_review_index not in topk_indices:
-                num_samples += 1
-            else:
+            if actual_review_index in topk_indices:
                 review_rank = (topk_indices == actual_review_index).nonzero(as_tuple=True)[0].item() + 1
-                mrr = 1 / (review_rank)
-                num_samples += 1
-                total_mrr += mrr
+                rr = 1 / (review_rank)
+                total_rr += rr
+            num_samples += 1
+                
 
-    print(f"Eval Average MRR@10: {total_mrr/num_samples}")
+    print_file(f"Eval Average MRR@10: {total_rr/num_samples}")
 
 
 def save_model(model, optimizer, loss, i):
@@ -437,10 +516,7 @@ def save_model(model, optimizer, loss, i):
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss,
         'd_model': D_MODEL,
-        'num_heads': NUM_HEADS,
-        'num_layers':NUM_LAYERS,
         'lr': LR,
-        'ff_dim': FF_DIM,
         'batch_size': BATCH_SIZE
     }, model_path)
 
@@ -448,37 +524,32 @@ def save_model(model, optimizer, loss, i):
 
 
 def train_embedder(model, dataloader, user_val, review_val, match_val, epochs, lr):
-    model = model
-
-    criterion = nn.CosineEmbeddingLoss()
+    # criterion = ContrastiveLoss(margin=3)
     # criterion = nn.MSELoss()
-    
+    criterion = nn.CosineEmbeddingLoss(margin=0.5)
     optimizer = optim.Adam(model.parameters(), lr=lr)
     
-    model.train()
-    print("Starting model training")
+    eval_model(model, user_val, review_val, match_val, frac=1)
+    print_file("Starting model training")
     for i in range(epochs):
         total_loss = 0
         num_samples = 0
         loss = 0
+        model.train()
         for iter, batch in enumerate(dataloader):
-              # Set model to training mode
-            users, reviews = batch
             if iter % SAVE_EVERY == SAVE_EVERY -1:
                 save_model(model, optimizer, loss, i)
-                eval_model(model, user_val, review_val, match_val)
-                model.train()
+              # Set model to training mode
             # with autograd.detect_anomaly():
             optimizer.zero_grad()  # Reset gradients
-            users, reviews = batch
-            embedded_reviews = embed_llm(reviews)
-            
+            users, reviews, targets = batch
+            # embedded_reviews = embed_llm(reviews)
+            reviews = reviews.to('cuda')
             embedded_users = model(users)
-            targets = torch.ones((embedded_reviews.shape[0]))
-            # print(f'shapes: users: {embedded_users.shape} \n reviews: {embedded_reviews.shape} \n targets: {targets.shape}')
-            loss = criterion(embedded_users, embedded_reviews, target=targets)
+            # print_file(f'shapes: users: {embedded_users.shape} \n reviews: {embedded_reviews.shape} \n targets: {targets.shape}')
+            loss = criterion(embedded_users, reviews, target=targets)
             if torch.isnan(loss):
-                print("nan loss")
+                print_file("nan loss")
                 exit()
             # Backpropagation
             # loss.requires_grad = True
@@ -487,25 +558,14 @@ def train_embedder(model, dataloader, user_val, review_val, match_val, epochs, l
             optimizer.step()
             loss_iter = loss.item()
             
-            del users, embedded_users, embedded_reviews, reviews, targets
-            
-            gc.collect()
-
-            
             total_loss += loss_iter
-            num_samples += BATCH_SIZE
-            if i % PRINT_EVERY == 0:
-                print(f'Loss at iter {iter}: {loss_iter}')
-                
-        print(f'{i} Epoch Loss Avg: {total_loss / num_samples}')
-        model_path = f"Models/model_B_epoch-{i}"
-        torch.save({
-            'epoch': i,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': loss,
-        }, model_path)
-
+            num_samples += 1
+            if iter % PRINT_EVERY == 0:
+                print_file(f'Average Loss at Iter {iter}: {total_loss/ num_samples}')
+        
+        print_file(f'{i} Epoch Loss Avg: {total_loss / num_samples}')
+        save_model(model, optimizer, loss, i)
+        eval_model(model, user_val, review_val, match_val)
     # Save the model
     model_path = f"Models/model_A_final"
     torch.save(model.state_dict(), model_path)
@@ -514,26 +574,24 @@ def train_embedder(model, dataloader, user_val, review_val, match_val, epochs, l
 # In[58]:
 
 
-model = TransformerEncoder(d_model=D_MODEL, num_heads=NUM_HEADS, num_layers=NUM_LAYERS, ff_dim=FF_DIM)
+model = LatentSpaceEmbedder()
 
 
 # In[32]:
 
+dataset = UserReviewDataset(prep_users_train, prep_reviews_train, matches_train)
 
-dataset = UserReviewDataset(prep_users_train, reviews_train, matches_train)
+negative_sampledataset = NegativeSampleDataset(prep_users_train, prep_reviews_train, matches_train)
+
+concatenated_dataset = torch.utils.data.ConcatDataset([dataset, negative_sampledataset])
 
 
-# In[33]:
 
-
-dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE, shuffle=True, generator=torch.Generator(device='cuda'))
-
+dataloader = DataLoader(dataset=concatenated_dataset, batch_size=BATCH_SIZE, shuffle=True, generator=torch.Generator(device='cuda'))
 
 # In[ ]:
-
-
 # del_all(model, dataset, dataloader)
-train_embedder(model, dataloader, prep_users_val, reviews_val, matches_val, EPOCHS, LR) 
+train_embedder(model, dataloader, prep_users_val, prep_reviews_val, matches_val, EPOCHS, LR)
 
 
 # In[ ]:
