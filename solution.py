@@ -414,7 +414,7 @@ class NegativeSampleDataset(Dataset):
         # get value from series
         review_embed = random_review['review_embed'].values[0]
         user = torch.tensor(user.values.astype(np.float32), dtype=torch.get_default_dtype()).detach()
-        target = -1
+        target = 0
         return user, review_embed, target
 
 
@@ -481,8 +481,8 @@ def eval_model(model, user_val, review_val, match_val, frac=1):
     num_samples = 0
     print_file("Starting model eval")
     with torch.no_grad():
-        similarity = torch.nn.CosineSimilarity()
-        # similarity = F.pairwise_distance
+        # similarity = torch.nn.CosineSimilarity()
+        similarity = F.pairwise_distance
         for batch in dataloader:
             user, accommodation_id, actual_review_id = batch
             possible_user_reviews = review_val[review_val['accommodation_id'] == accommodation_id.item()]
@@ -496,7 +496,7 @@ def eval_model(model, user_val, review_val, match_val, frac=1):
             embedded_user = model(user).cpu().type(torch.float32)
             similarity_vector = similarity(embedded_user, possible_user_reviews_embed)
             k = min(10, len(possible_user_reviews))
-            topk_values, topk_indices = torch.topk(similarity_vector, k=k, largest=True)
+            topk_values, topk_indices = torch.topk(similarity_vector, k=k, largest=False)
            
             if actual_review_index in topk_indices:
                 review_rank = (topk_indices == actual_review_index).nonzero(as_tuple=True)[0].item() + 1
@@ -524,9 +524,9 @@ def save_model(model, optimizer, loss, i):
 
 
 def train_embedder(model, dataloader, user_val, review_val, match_val, epochs, lr):
-    # criterion = ContrastiveLoss(margin=3)
+    criterion = ContrastiveLoss(margin=0.5)
     # criterion = nn.MSELoss()
-    criterion = nn.CosineEmbeddingLoss(margin=0.5)
+    # criterion = nn.CosineEmbeddingLoss(margin=0.5)
     optimizer = optim.Adam(model.parameters(), lr=lr)
     
     eval_model(model, user_val, review_val, match_val, frac=1)
@@ -543,7 +543,6 @@ def train_embedder(model, dataloader, user_val, review_val, match_val, epochs, l
             # with autograd.detect_anomaly():
             optimizer.zero_grad()  # Reset gradients
             users, reviews, targets = batch
-            # embedded_reviews = embed_llm(reviews)
             reviews = reviews.to('cuda')
             embedded_users = model(users)
             # print_file(f'shapes: users: {embedded_users.shape} \n reviews: {embedded_reviews.shape} \n targets: {targets.shape}')
